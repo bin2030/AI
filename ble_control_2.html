@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 BLE Controller</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; background: #030712; }
+        /* 隱藏未載入前的內容 */
+        #root:empty { display: none; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useRef, useEffect, useCallback } = React;
+
+        // --- 配置區域 ---
+        const BLE_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+        const BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+        const BLE_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+        // --- 子元件: Knob (旋鈕) ---
+        function Knob({ value, min, max, step = 1, onChange, label, unit = "", color, size = 88 }) {
+            const state = useRef({ dragging: false, lastY: 0, work: value });
+            state.current.work = value;
+            const range = max - min;
+            const pct = Math.max(0, Math.min(1, (value - min) / range));
+            const ARC = 270, START = -135;
+            const angle = START + pct * ARC;
+            const cx = size / 2, cy = size / 2, R = size / 2 - 9, SW = 7;
+
+            const polar = (deg, r = R) => {
+                const rad = ((deg - 90) * Math.PI) / 180;
+                return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+            };
+            const arcPath = (from, to) => {
+                const [sx, sy] = polar(from);
+                const [ex, ey] = polar(to);
+                return `M ${sx} ${sy} A ${R} ${R} 0 ${to - from > 180 ? 1 : 0} 1 ${ex} ${ey}`;
+            };
+            const [ix, iy] = polar(angle, R - 11);
+
+            const onPointerDown = (e) => {
+                e.preventDefault();
+                state.current.dragging = true;
+                state.current.lastY = e.clientY;
+                const onMove = (ev) => {
+                    if (!state.current.dragging) return;
+                    const dy = state.current.lastY - ev.clientY;
+                    state.current.lastY = ev.clientY;
+                    state.current.work = Math.max(min, Math.min(max, state.current.work + dy * (range / 90)));
+                    onChange(Math.round(state.current.work / step) * step);
+                };
+                const onUp = () => {
+                    state.current.dragging = false;
+                    window.removeEventListener("pointermove", onMove);
+                    window.removeEventListener("pointerup", onUp);
+                };
+                window.addEventListener("pointermove", onMove);
+                window.addEventListener("pointerup", onUp);
+            };
+
+            return (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+                    <svg width={size} height={size} onPointerDown={onPointerDown} style={{ cursor: "ns-resize", touchAction: "none" }}>
+                        <path d={arcPath(START, START + ARC)} fill="none" stroke="#1e293b" strokeWidth={SW} strokeLinecap="round" />
+                        {pct > 0.005 && <path d={arcPath(START, angle)} fill="none" stroke={color} strokeWidth={SW} strokeLinecap="round" />}
+                        <circle cx={cx} cy={cy} r={R - 14} fill="#0a0f1a" stroke="#1e293b" strokeWidth={1.5} />
+                        <line x1={cx} y1={cy} x2={ix} y2={iy} stroke={color} strokeWidth="2.5" strokeLinecap="round" />
+                        <circle cx={cx} cy={cy} r={3.5} fill={color} />
+                    </svg>
+                    <div style={{ fontSize: 18, fontWeight: 700, color, fontFamily: "monospace" }}>{value}{unit}</div>
+                    <div style={{ fontSize: 9, color: "#475569", textTransform: "uppercase" }}>{label}</div>
+                </div>
+            );
+        }
+
+        // --- 子元件: LedBulb ---
+        function LedBulb({ on, color, brightness }) {
+            return (
+                <div style={{
+                    width: 14, height: 14, borderRadius: "50%",
+                    background: on ? color : "#1e293b",
+                    boxShadow: on ? `0 0 ${brightness/5}px ${color}` : "none",
+                    border: `2px solid ${on ? color : "#334155"}`,
+                    transition: "all 0.2s"
+                }} />
+            );
+        }
+
+        // --- 主應用程式 ---
+        function App() {
+            const [connected, setConnected] = useState(false);
+            const [connecting, setConnecting] = useState(false);
+            const [targetName, setTargetName] = useState("ESP32-Servo-BLE");
+            const [angle, setAngle] = useState(90);
+            const [logs, setLogs] = useState(["▶ 系統就緒"]);
+            
+            const rxRef = useRef(null);
+            const devRef = useRef(null);
+
+            const log = useCallback((msg) => {
+                setLogs(p => [`${new Date().toLocaleTimeString()} ${msg}`, ...p].slice(0, 30));
+            }, []);
+
+            const send = async (cmd) => {
+                if (!rxRef.current || !connected) return;
+                try {
+                    await rxRef.current.writeValueWithoutResponse(new TextEncoder().encode(cmd + "\n"));
+                    log(`↑ ${cmd}`);
+                } catch (e) { log(`⚠ 錯誤: ${e.message}`); }
+            };
+
+            const connectBLE = async () => {
+                if (!navigator.bluetooth) return log("❌ 瀏覽器不支援 Web Bluetooth");
+                setConnecting(true);
+                try {
+                    const dev = await navigator.bluetooth.requestDevice({
+                        filters: [{ name: targetName }, { services: [BLE_SERVICE] }],
+                        optionalServices: [BLE_SERVICE]
+                    });
+                    log(`🔍 已連線至: ${dev.name}`);
+                    const server = await dev.gatt.connect();
+                    const service = await server.getPrimaryService(BLE_SERVICE);
+                    rxRef.current = await service.getCharacteristic(BLE_RX_UUID);
+                    
+                    dev.addEventListener("gattserverdisconnected", () => {
+                        setConnected(false);
+                        log("🔴 已中斷連線");
+                    });
+
+                    setConnected(true);
+                    log("🟢 連線成功！");
+                } catch (e) {
+                    log(`❌ 失敗: ${e.message}`);
+                } finally { setConnecting(false); }
+            };
+
+            const cardStyle = {
+                background: "rgba(10,15,26,0.9)",
+                border: "1px solid #1e293b",
+                borderRadius: 12,
+                padding: 16,
+                marginBottom: 12
+            };
+
+            return (
+                <div style={{ color: "#e2e8f0", fontFamily: "monospace", padding: 20, maxWidth: 400, margin: "auto" }}>
+                    <h3 style={{ color: "#38bdf8", textAlign: "center" }}>ESP32 BLE CTRL</h3>
+                    
+                    {/* 設定區 */}
+                    <div style={cardStyle}>
+                        <div style={{ fontSize: 10, color: "#475569", marginBottom: 8 }}>DEVICE NAME FILTER</div>
+                        <input 
+                            type="text" 
+                            value={targetName} 
+                            onChange={(e) => setTargetName(e.target.value)}
+                            disabled={connected}
+                            style={{
+                                width: "100%", background: "#0a0f1a", border: "1px solid #334155",
+                                color: "#4ade80", padding: "8px 0", textAlign: "center",
+                                fontSize: 14, borderRadius: 6, marginBottom: 12
+                            }}
+                        />
+                        <button 
+                            onClick={connected ? () => devRef.current.gatt.disconnect() : connectBLE}
+                            style={{
+                                width: "100%", padding: 10, borderRadius: 6, cursor: "pointer",
+                                background: connected ? "#ef444420" : "#38bdf820",
+                                color: connected ? "#ef4444" : "#38bdf8",
+                                border: `1px solid ${connected ? "#ef4444" : "#38bdf8"}`,
+                                fontWeight: "bold"
+                            }}
+                        >
+                            {connecting ? "CONNECTING..." : connected ? "DISCONNECT" : "CONNECT BLE"}
+                        </button>
+                    </div>
+
+                    {/* 控制區 */}
+                    <div style={{ ...cardStyle, borderColor: "#14532d", textAlign: "center" }}>
+                        <div style={{ fontSize: 50, color: "#4ade80" }}>{angle}°</div>
+                        <input 
+                            type="range" min="0" max="180" value={angle} 
+                            onChange={(e) => { setAngle(e.target.value); send(`SA:${e.target.value}`); }}
+                            style={{ width: "100%", accentColor: "#4ade80" }}
+                        />
+                        <div style={{ display: "flex", justifyContent: "center", marginTop: 20 }}>
+                            <Knob value={angle} min={0} max={180} onChange={(v) => { setAngle(v); send(`SA:${v}`); }} label="SERVO" color="#4ade80" />
+                        </div>
+                    </div>
+
+                    {/* 日誌區 */}
+                    <div style={{ ...cardStyle, fontSize: 10, height: 100, overflowY: "auto", background: "#000" }}>
+                        {logs.map((l, i) => <div key={i} style={{ borderBottom: "1px solid #111", padding: 2 }}>{l}</div>)}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
